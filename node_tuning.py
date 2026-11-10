@@ -170,11 +170,81 @@ def diagnostic():
         ('Логирование Docker', 'docker', 'info', '--format', '{{.LoggingDriver}}'),
         ('Контейнеры', 'docker', 'ps', '--format', '{{.Names}}\t{{.Status}}'),
     ]
-    for name, cmd, *args in commands:
+    details = [(name, read(cmd, *args)) for name, cmd, *args in commands]
+    data = dict(details)
+    def section(name):
         print('\n  ' + styled(name, 'cyan', True))
-        value = read(cmd, *args)
-        print('\n'.join('    ' + line for line in (value or 'нет данных').splitlines()))
-    notice('Проверка не загружает модули и не проводит нагрузочный тест.')
+    def row(label, value):
+        print(f'    {label:<18} {value or "нет данных"}')
+    def kernel_value(key):
+        result = read('sysctl', '-n', key)
+        return ' '.join(result.split()) if result else 'нет данных'
+    def human_bytes(value):
+        return f'{value / 2**30:.2f} ГиБ' if value >= 2**30 else f'{value / 2**20:.0f} МиБ'
+
+    iface = default_iface()
+    addresses = []
+    ip_data = read('ip', '-j', 'address', 'show', 'dev', iface) if iface else ''
+    try:
+        for interface in json.loads(ip_data):
+            for addr in interface.get('addr_info', []):
+                if addr.get('scope') == 'global':
+                    addresses.append(f'{addr.get("local")}/{addr.get("prefixlen")}')
+    except (ValueError, TypeError):
+        pass
+    section('СЕТЬ')
+    row('Интерфейс', iface or 'не определён однозначно')
+    row('Адреса', ', '.join(addresses) or 'нет глобальных адресов / недоступно')
+    congestion = kernel_value('net.ipv4.tcp_congestion_control')
+    row('TCP алгоритм', congestion)
+    qdisc_text = data['Очереди']
+    qdisc_lines = qdisc_text.splitlines()
+    queue = 'недоступно'
+    for index, line in enumerate(qdisc_lines):
+        if iface and re.search(r'\bdev\s+' + re.escape(iface) + r'\s+root\b', line):
+            kind = re.search(r'^qdisc\s+(\S+)', line)
+            following = qdisc_lines[index + 1] if index + 1 < len(qdisc_lines) else ''
+            drops = re.search(r'\bdropped\s+(\d+)', following)
+            queue = (kind.group(1) if kind else 'неизвестно') + (f' · потери в очереди: {drops.group(1)}' if drops else '')
+            break
+    row('Очередь', queue)
+    row('MTU probing', kernel_value('net.ipv4.tcp_mtu_probing'))
+    count = kernel_value('net.netfilter.nf_conntrack_count')
+    maximum = kernel_value('net.netfilter.nf_conntrack_max')
+    percent = f' ({int(count) / int(maximum) * 100:.1f}%)' if count.isdigit() and maximum.isdigit() and int(maximum) else ''
+    row('Conntrack', f'{count} / {maximum}{percent}')
+
+    mem = meminfo()
+    total = mem.get('MemTotal', 0); available = mem.get('MemAvailable', 0)
+    swap_total = mem.get('SwapTotal', 0); swap_used = max(0, swap_total - mem.get('SwapFree', 0))
+    disk = shutil.disk_usage('/var')
+    section('РЕСУРСЫ')
+    row('RAM', f'{human_bytes(available)} доступно из {human_bytes(total)}')
+    row('Swap', f'{human_bytes(swap_used)} занято из {human_bytes(swap_total)}')
+    row('Диск /var', f'{human_bytes(disk.free)} свободно из {human_bytes(disk.total)} ({disk.used / disk.total * 100:.0f}% занято)')
+    try:
+        row('Нагрузка 1/5/15', ' / '.join(f'{x:.2f}' for x in os.getloadavg()))
+    except OSError:
+        row('Нагрузка 1/5/15', 'недоступно')
+
+    section('DOCKER')
+    containers = data['Контейнеры']
+    if containers == 'недоступно':
+        row('Контейнеры', 'недоступно')
+    elif not containers:
+        row('Контейнеры', 'нет запущенных')
+    else:
+        for line in containers.splitlines():
+            name, _, status = line.partition('\t')
+            row(name, status)
+    row('Драйвер логов', data['Логирование Docker'])
+    print()
+    notice('Без изменений настроек и нагрузочного теста.')
+    if prompt('Подробнее: [д] полная диагностика / Enter — назад: ').casefold() in ('д', 'да', 'd', 'details'):
+        heading('ПОЛНАЯ ДИАГНОСТИКА')
+        for name, value in details:
+            print('\n  ' + styled(name, 'cyan', True))
+            print('\n'.join('    ' + line for line in (value or 'нет данных').splitlines()))
 
 
 def sysctl_get(key):
@@ -238,10 +308,26 @@ def parse_root_qdisc(iface):
         if token in switches:
             restored.append(token)
             i += 1
+        elif kind == 'fq' and token == 'bands':
+            # tc fq uses exactly three bands and sixteen priority mappings.
+            if (len(tail) < i + 19 or tail[i + 1] != '3' or tail[i + 2] != 'priomap'
+                    or any(x not in ('0', '1', '2') for x in tail[i + 3:i + 19])):
+                raise RuntimeError('Не удалось безопасно восстановить bands/priomap очереди fq.')
+            restored.extend(tail[i:i + 19])
+            i += 19
+        elif kind == 'fq' and token == 'weights':
+            weights = tail[i + 1:i + 4]
+            if len(weights) != 3 or any(not x.isascii() or not x.isdecimal() for x in weights):
+                raise RuntimeError('Не удалось безопасно восстановить weights очереди fq.')
+            restored.extend([token, *weights])
+            i += 4
         elif token in valued and i + 1 < len(tail) and re.fullmatch(r'[0-9A-Za-z.%/-]+', tail[i + 1]):
             value = tail[i + 1]
             # tc prints packet counts with a p suffix, but accepts plain integers.
             if token in ('limit', 'flow_limit') and re.fullmatch(r'[0-9]+p', value):
+                value = value[:-1]
+            # fq similarly prints byte counts with b, but parses unsigned integers.
+            if kind == 'fq' and token in ('quantum', 'initial_quantum') and re.fullmatch(r'[0-9]+b', value):
                 value = value[:-1]
             restored.extend((token, value))
             i += 2
