@@ -47,14 +47,27 @@ def confirm(message):
     return prompt(message + ' [да/нет]: ').casefold() in ('д', 'да', 'y', 'yes')
 
 
+def interactive_visuals():
+    return sys.stdout.isatty() and os.environ.get('TERM') != 'dumb'
+
+
+def clear_screen():
+    if interactive_visuals() and not os.environ.get('NO_CLEAR'):
+        print('\033[2J\033[H', end='', flush=True)
+
+
+def animate(message):
+    if not interactive_visuals() or os.environ.get('NO_ANIMATION'):
+        return
+    for frame in ('◐', '◓', '◑', '◒', '◐', '◓'):
+        print('\r' + styled('  ' + frame + '  ' + message, 'cyan'), end='', flush=True)
+        time.sleep(0.10)
+    print('\r\033[K', end='', flush=True)
+
+
 def banner():
     print(styled('\n  NODE TUNING  /  SERVER SETUP', 'cyan', True))
-    if (sys.stdout.isatty() and os.environ.get('TERM') != 'dumb'
-            and not os.environ.get('NO_COLOR') and not os.environ.get('NO_ANIMATION')):
-        for frame in ('◐', '◓', '◑', '◒'):
-            print('\r' + styled('  ' + frame + '  Подготовка интерфейса', 'cyan'), end='', flush=True)
-            time.sleep(0.06)
-        print('\r' + ' ' * 42 + '\r', end='', flush=True)
+    animate('Подготовка интерфейса')
 
 
 def run(*args, check=True):
@@ -140,6 +153,7 @@ def system_info():
 
 def diagnostic():
     heading('ПРОВЕРКА СЕРВЕРА')
+    animate('Собираем данные о сервере')
     commands = [
         ('Адреса', 'ip', '-br', 'address'),
         ('Маршрут', 'ip', 'route', 'show', 'default'),
@@ -212,20 +226,28 @@ def parse_root_qdisc(iface):
     if tail[:1] == ['refcnt'] and len(tail) >= 2:
         tail = tail[2:]
     # Reject unknown options rather than pretend that rollback can restore them.
-    valued = {'limit', 'flows', 'quantum', 'target', 'interval', 'memory_limit',
+    valued = {'limit', 'flow_limit', 'flows', 'quantum', 'target', 'interval', 'memory_limit',
               'drop_batch', 'buckets', 'maxrate', 'low_rate_threshold', 'orphan_mask',
-              'ce_threshold', 'initial_quantum', 'timer_slack', 'horizon'}
+              'ce_threshold', 'ce_threshold_selector', 'initial_quantum', 'timer_slack', 'horizon',
+              'refill_delay', 'defrate', 'offload_horizon'}
     switches = {'ecn', 'noecn', 'pacing', 'nopacing', 'horizon_drop', 'horizon_cap'}
+    restored = []
     i = 0
     while i < len(tail):
         token = tail[i]
         if token in switches:
+            restored.append(token)
             i += 1
         elif token in valued and i + 1 < len(tail) and re.fullmatch(r'[0-9A-Za-z.%/-]+', tail[i + 1]):
+            value = tail[i + 1]
+            # tc prints packet counts with a p suffix, but accepts plain integers.
+            if token in ('limit', 'flow_limit') and re.fullmatch(r'[0-9]+p', value):
+                value = value[:-1]
+            restored.extend((token, value))
             i += 2
         else:
             raise RuntimeError('Неподдерживаемый параметр очереди: ' + token + '. Изменение отменено.')
-    return kind, tail
+    return kind, restored
 
 
 def tune_cake():
@@ -235,6 +257,7 @@ def tune_cake():
     iface = default_iface()
     if not iface:
         raise RuntimeError('Маршрут по умолчанию не определён однозначно.')
+    animate('Проверяем текущую очередь и возможность отката')
     kind, options = parse_root_qdisc(iface)
     print('  Интерфейс:', iface, '| текущая очередь:', kind)
     print('  CAKE управляет исходящим трафиком интерфейса; скорость подбирается по измерениям.')
@@ -250,6 +273,7 @@ def tune_cake():
         raise RuntimeError('Маршрут или очередь изменились во время подготовки; повторите операцию.')
     record = begin('cake', {'iface': iface, 'old_kind': kind, 'old_options': options,
                             'rate': int(rate), 'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()})
+    animate('Применяем CAKE')
     run('tc', 'qdisc', 'replace', 'dev', iface, 'root', 'cake', 'bandwidth', rate + 'mbit')
     qdisc = run('tc', 'qdisc', 'show', 'dev', iface).stdout
     if not re.search(r'\bqdisc cake\b.*\broot\b', qdisc):
@@ -407,6 +431,7 @@ def main():
     lock = open('/run/prism-node-tuning.lock', 'w')
     try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError: sys.exit('Другой экземпляр уже запущен.')
+    clear_screen()
     banner()
     while True:
         try:
@@ -417,18 +442,36 @@ def main():
                                   ('5', 'Откатить изменение'), ('0', 'Выход')]:
                 print(f'  {styled("[" + number + "]", "cyan", True)}  {label}')
             choice = prompt('Выберите действие: ')
+            if choice in ('0', 'q', 'exit', 'выход'):
+                animate('Завершаем работу')
+                clear_screen()
+                notice('Скрипт завершён.', 'ok')
+                return
+            clear_screen()
             if choice == '1': diagnostic()
             elif choice == '2': tune_bbr()
             elif choice == '3': tune_swap()
             elif choice == '4': tune_cake()
             elif choice == '5': rollback()
-            elif choice in ('0', 'q', 'exit', 'выход'): return
             else: notice('Выберите пункт меню.', 'warn')
         except (KeyboardInterrupt, EOFError):
             print(); return
         except Exception as exc:
             notice(str(exc), 'error')
-            if CURRENT.exists(): notice('Состояние сохранено. При необходимости выберите откат.', 'warn')
+            try:
+                after = current()
+                if any(item.get('status') == 'prepared' for item in after.values()):
+                    notice('Есть незавершённое изменение. Проверьте пункт отката.', 'warn')
+                elif after:
+                    notice('Существующие изменения доступны в пункте отката.', 'info')
+            except Exception:
+                notice('Не удалось прочитать состояние изменений; проверьте его вручную.', 'warn')
+        try:
+            prompt('Enter — вернуться в меню ')
+            animate('Возвращаемся в меню')
+            clear_screen()
+        except (KeyboardInterrupt, EOFError):
+            print(); return
 
 
 if __name__ == '__main__':
