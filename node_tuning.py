@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -336,6 +337,45 @@ def parse_root_qdisc(iface):
     return kind, restored
 
 
+def measure_upload(iface):
+    """Measure outbound TCP throughput to Cloudflare; never modify the qdisc."""
+    if not shutil.which('curl'):
+        raise RuntimeError('Для замера нужен curl. Установите пакет curl и повторите попытку.')
+    sample_bytes = 32 * 1024 * 1024
+    measurements = []
+    with tempfile.TemporaryDirectory(prefix='prism-upload-') as temp:
+        payload = Path(temp) / 'payload.bin'
+        # Reading the sparse file sends zero bytes; no user files are uploaded.
+        with payload.open('wb') as stream:
+            stream.truncate(sample_bytes)
+        for i in range(1, 4):
+            print(f'  Замер {i}/3: отправляем 32 МиБ через {iface}…', flush=True)
+            p = run('curl', '-q', '--noproxy', '*', '-4', '--interface', iface,
+                    '--silent', '--show-error', '--connect-timeout', '8', '--max-time', '45',
+                    '--header', 'Expect:', '--data-binary', '@' + str(payload),
+                    '--output', '/dev/null', '--write-out', '%{http_code} %{size_upload} %{speed_upload} %{time_total}',
+                    'https://speed.cloudflare.com/__up', check=False)
+            fields = p.stdout.strip().split()
+            if p.returncode or len(fields) != 4:
+                raise RuntimeError('Замер не завершился; настройки не изменены. ' + (p.stderr.strip() or p.stdout.strip()))
+            try:
+                status = int(fields[0]); sent = int(float(fields[1]))
+                speed_bps = float(fields[2]); duration = float(fields[3])
+            except ValueError:
+                raise RuntimeError('Некорректный ответ curl; настройки не изменены.')
+            if not 200 <= status < 300 or sent != sample_bytes or not 0 < speed_bps < 1e12 or duration <= 0:
+                raise RuntimeError(f'Неполный замер (HTTP {status}, отправлено {sent} байт); настройки не изменены.')
+            rate = speed_bps * 8 / 1_000_000
+            measurements.append(rate)
+            print(f'    {rate:.1f} Мбит/с · {duration:.1f} с')
+            if duration < 1:
+                notice('Замер очень короткий; оценка скорости может быть неточной.', 'warn')
+    median = statistics.median(measurements)
+    if min(measurements) < median * 0.5:
+        raise RuntimeError('Замеры сильно различаются. Повторите в спокойное время; настройки не изменены.')
+    return measurements, median
+
+
 def tune_cake():
     heading('CAKE — ТЕСТ ОЧЕРЕДИ')
     if 'cake' in current():
@@ -346,21 +386,28 @@ def tune_cake():
     animate('Проверяем текущую очередь и возможность отката')
     kind, options = parse_root_qdisc(iface)
     print('  Интерфейс:', iface, '| текущая очередь:', kind)
-    print('  CAKE управляет исходящим трафиком интерфейса; скорость подбирается по измерениям.')
+    print('  CAKE управляет исходящим трафиком интерфейса; скорость измеряется автоматически.')
     print('  Ограничение влияет на все исходящие соединения. После перезагрузки CAKE не сохраняется.')
-    rate = prompt('Скорость в Мбит/с (целое число; 0 — отмена): ')
-    if rate == '0':
+    print('  Тест отправит 3 × 32 МиБ в Cloudflare по IPv4 и может временно загрузить канал.')
+    if not confirm('Запустить замер?'):
         return
-    if not rate.isascii() or not rate.isdecimal() or not 1 <= int(rate) <= 100000:
-        raise ValueError('Укажите целое число от 1 до 100000.')
-    if not confirm(f'Установить CAKE на {iface} с ограничением {rate} Мбит/с?'):
+    measurements, median = measure_upload(iface)
+    # Leave headroom for queuing under our control; this is a starting estimate, not a link guarantee.
+    rate_kbit = int(median * 1000 * 0.90)
+    if not 1 <= rate_kbit <= 100_000_000:
+        raise RuntimeError('Полученная скорость вне поддерживаемого диапазона; настройки не изменены.')
+    print(f'  Медиана исходящей скорости: {median:.1f} Мбит/с')
+    print(f'  Предлагаемый CAKE: {rate_kbit / 1000:.3f} Мбит/с (90% медианы)')
+    notice('Это оценка маршрута к Cloudflare; скорость до клиентов может отличаться.', 'warn')
+    if not confirm(f'Установить CAKE на {iface} с этим ограничением?'):
         return
     if default_iface() != iface or parse_root_qdisc(iface) != (kind, options):
         raise RuntimeError('Маршрут или очередь изменились во время подготовки; повторите операцию.')
     record = begin('cake', {'iface': iface, 'old_kind': kind, 'old_options': options,
-                            'rate': int(rate), 'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()})
+                            'rate_kbit': rate_kbit, 'upload_mbps': measurements,
+                            'boot_id': Path('/proc/sys/kernel/random/boot_id').read_text().strip()})
     animate('Применяем CAKE')
-    run('tc', 'qdisc', 'replace', 'dev', iface, 'root', 'cake', 'bandwidth', rate + 'mbit')
+    run('tc', 'qdisc', 'replace', 'dev', iface, 'root', 'cake', 'bandwidth', str(rate_kbit) + 'kbit')
     qdisc = run('tc', 'qdisc', 'show', 'dev', iface).stdout
     if not re.search(r'\bqdisc cake\b.*\broot\b', qdisc):
         raise RuntimeError('Не удалось подтвердить CAKE; используйте откат.')
